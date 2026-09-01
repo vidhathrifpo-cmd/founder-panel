@@ -1,21 +1,3 @@
-"""
-invoice_pdf_service
-
-Standalone service that takes an invoice payload (from the invoice_generator
-TS script), renders a PDF using reportlab, uploads it to a shared Google
-Drive folder, and returns the file's shareable URL.
-
-Runs independently of the DB-querying logic in index.ts -- invoice_generator
-POSTs the already-assembled payload here; this service knows nothing about
-Supabase. Keeps the "what to invoice" and "how to render/store a PDF"
-concerns fully separate, per the modular-scripts approach.
-
-Run locally:    uvicorn main:app --host 0.0.0.0 --port 8000
-Env required:
-    GOOGLE_SERVICE_ACCOUNT_JSON   -- path to a service account key file
-    DRIVE_INVOICES_FOLDER_ID      -- ID of the shared Drive folder to upload into
-"""
-
 import io
 import os
 from datetime import datetime
@@ -32,21 +14,22 @@ from reportlab.platypus import (
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_RIGHT, TA_CENTER
 
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 app = FastAPI(title="Vidhathri Invoice PDF Service")
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-DRIVE_SALES_FOLDER_ID = os.environ.get("DRIVE_SALES_FOLDER_ID", "")  # the "1.Sales" folder under Accounting
+
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
+GOOGLE_OAUTH_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
+GOOGLE_OAUTH_REFRESH_TOKEN = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN", "")
+DRIVE_ACCOUNTING_FOLDER_ID = os.environ.get("DRIVE_ACCOUNTING_FOLDER_ID", "")
 
 NAVY = colors.HexColor("#1F3B57")
 GREY = colors.HexColor("#F2F2F2")
 
-
-# ---------- Request schema (mirrors InvoicePayload from index.ts) ----------
 
 class LineItem(BaseModel):
     sku: str
@@ -70,6 +53,7 @@ class InvoiceRequest(BaseModel):
     saleId: str
     invoiceNumber: str
     invoiceDate: str
+    voucherType: str
     billTo: BillTo
     lineItems: List[LineItem]
     subtotal: float
@@ -83,8 +67,6 @@ class InvoiceResponse(BaseModel):
     driveFileId: str
 
 
-# ---------- PDF rendering ----------
-
 def render_invoice_pdf(inv: InvoiceRequest) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=20 * mm, bottomMargin=20 * mm,
@@ -97,7 +79,7 @@ def render_invoice_pdf(inv: InvoiceRequest) -> bytes:
 
     story = []
     story.append(Paragraph("VIDHATHRI FARMERS PRODUCER COMPANY LIMITED", title_style))
-    story.append(Paragraph("Kota, Brahmavara Taluk, Udupi District, Karnataka \u2014 576221", normal))
+    story.append(Paragraph("Kota, Brahmavara Taluk, Udupi District, Karnataka — 576221", normal))
     story.append(Spacer(1, 10 * mm))
     story.append(Paragraph(f"<b>INVOICE</b>", ParagraphStyle("InvHead", parent=styles["Heading2"], textColor=NAVY)))
 
@@ -122,7 +104,6 @@ def render_invoice_pdf(inv: InvoiceRequest) -> bytes:
     story.append(Paragraph("<br/>".join(bill_to_lines), normal))
     story.append(Spacer(1, 8 * mm))
 
-    # Line items table
     header = ["SKU", "Item", "Qty", "Rate", "GST%", "GST Amt", "Total"]
     rows = [header]
     for li in inv.lineItems:
@@ -157,14 +138,6 @@ def render_invoice_pdf(inv: InvoiceRequest) -> bytes:
     return buf.getvalue()
 
 
-# ---------- Drive upload ----------
-#
-# Target layout: Accounting/1.Sales/{YYYY}/{MM}/invoice.pdf
-# Month folders are found-or-created on the fly so no manual setup is needed
-# each month. Only the Sales branch is used here -- Purchase/Payment folders
-# are for future scripts (purchase recording, payment reconciliation), not
-# this service.
-
 def find_or_create_folder(drive, name: str, parent_id: str) -> str:
     query = (
         f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' "
@@ -181,21 +154,29 @@ def find_or_create_folder(drive, name: str, parent_id: str) -> str:
     return created["id"]
 
 
-def get_sales_month_folder(drive, invoice_date: str) -> str:
+def get_voucher_month_folder(drive, voucher_type: str, invoice_date: str) -> str:
     dt = datetime.strptime(invoice_date, "%Y-%m-%d")
-    year_folder_id = find_or_create_folder(drive, f"{dt.year:04d}", DRIVE_SALES_FOLDER_ID)
+    voucher_folder_id = find_or_create_folder(drive, voucher_type, DRIVE_ACCOUNTING_FOLDER_ID)
+    year_folder_id = find_or_create_folder(drive, f"{dt.year:04d}", voucher_folder_id)
     month_folder_id = find_or_create_folder(drive, f"{dt.month:02d}", year_folder_id)
     return month_folder_id
 
 
-def upload_to_drive(pdf_bytes: bytes, filename: str, invoice_date: str) -> tuple[str, str]:
-    if not SERVICE_ACCOUNT_FILE or not DRIVE_SALES_FOLDER_ID:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON / DRIVE_SALES_FOLDER_ID not configured")
+def upload_to_drive(pdf_bytes: bytes, filename: str, voucher_type: str, invoice_date: str) -> tuple[str, str]:
+    if not (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REFRESH_TOKEN and DRIVE_ACCOUNTING_FOLDER_ID):
+        raise RuntimeError("Google OAuth credentials / DRIVE_ACCOUNTING_FOLDER_ID not configured")
 
-    creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    creds = UserCredentials(
+        None,
+        refresh_token=GOOGLE_OAUTH_REFRESH_TOKEN,
+        client_id=GOOGLE_OAUTH_CLIENT_ID,
+        client_secret=GOOGLE_OAUTH_CLIENT_SECRET,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=SCOPES,
+    )
     drive = build("drive", "v3", credentials=creds)
 
-    target_folder_id = get_sales_month_folder(drive, invoice_date)
+    target_folder_id = get_voucher_month_folder(drive, voucher_type, invoice_date)
 
     media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf", resumable=False)
     file_metadata = {"name": filename, "parents": [target_folder_id]}
@@ -203,14 +184,12 @@ def upload_to_drive(pdf_bytes: bytes, filename: str, invoice_date: str) -> tuple
     return created["id"], created["webViewLink"]
 
 
-# ---------- Endpoint ----------
-
 @app.post("/generate-invoice", response_model=InvoiceResponse)
 def generate_invoice(inv: InvoiceRequest):
     try:
         pdf_bytes = render_invoice_pdf(inv)
         filename = f"{inv.invoiceNumber.replace('/', '_')}.pdf"
-        file_id, url = upload_to_drive(pdf_bytes, filename, inv.invoiceDate)
+        file_id, url = upload_to_drive(pdf_bytes, filename, inv.voucherType, inv.invoiceDate)
         return InvoiceResponse(invoiceNumber=inv.invoiceNumber, fileUrl=url, driveFileId=file_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
